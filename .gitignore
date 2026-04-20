@@ -1,0 +1,18 @@
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env / OS
+.env
+.env.*
+.DS_Store
+
+# Vendored upstream clone (use pip install pokerkit)
+pokerkit/

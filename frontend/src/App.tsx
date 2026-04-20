@@ -19,6 +19,25 @@ type AnalyzeResponse = {
   confidence: 'high' | 'mixed' | 'low'
 }
 
+type SolveStatus = {
+  id: string
+  status: 'pending' | 'running' | 'done' | 'error'
+  progress: number
+  message: string
+  elapsed_s: number
+  error: string | null
+  result: {
+    root_strategy: Record<string, number>
+    root_actions: string[]
+    iterations_done: number
+    villain_combos_used: number
+    exploitability_proxy: number
+    top_action: string
+    top_action_frequency: number
+    villain_range_used: string
+  } | null
+}
+
 const POSITIONS = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB'] as const
 const FACING_ACTIONS = [
   { id: 'none', label: 'No action — hero opens' },
@@ -57,6 +76,10 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
+
+  const [solving, setSolving] = useState(false)
+  const [solveStatus, setSolveStatus] = useState<SolveStatus | null>(null)
+  const [solveIterations, setSolveIterations] = useState(400)
 
   async function onAnalyze(e: React.FormEvent) {
     e.preventDefault()
@@ -100,6 +123,66 @@ function App() {
       setError(err instanceof Error ? err.message : 'Request failed')
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function onSolveGTO() {
+    setError(null)
+    setSolveStatus(null)
+    setSolving(true)
+    try {
+      const boardClean = normalizeCards(board)
+      if (![6, 8, 10].includes(boardClean.length)) {
+        throw new Error(
+          'GTO solver requires a postflop board (3, 4, or 5 cards).',
+        )
+      }
+      const body: Record<string, unknown> = {
+        hero_cards: normalizeCards(heroCards),
+        board: boardClean,
+        villain_range: opponentRange.trim() || 'auto',
+        pot,
+        to_call: toCall,
+        hero_stack: heroStack,
+        villain_stack:
+          effectiveStack !== '' && !Number.isNaN(effectiveStack)
+            ? effectiveStack
+            : heroStack,
+        hero_first_to_act: toCall === 0,
+        facing_action: facingAction,
+        iterations: solveIterations,
+        equity_samples: 250,
+      }
+      if (heroPosition) body.hero_position = heroPosition
+      if (aggressorPosition) body.aggressor_position = aggressorPosition
+
+      const startRes = await fetch('/api/solve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!startRes.ok) {
+        const err = await startRes.json().catch(() => ({}))
+        const detail = (err as { detail?: string }).detail
+        throw new Error(
+          typeof detail === 'string' ? detail : `HTTP ${startRes.status}`,
+        )
+      }
+      const start = (await startRes.json()) as SolveStatus
+      setSolveStatus(start)
+
+      for (let i = 0; i < 300; i++) {
+        await new Promise((r) => setTimeout(r, 600))
+        const sRes = await fetch(`/api/solve/${start.id}`)
+        if (!sRes.ok) throw new Error(`poll HTTP ${sRes.status}`)
+        const cur = (await sRes.json()) as SolveStatus
+        setSolveStatus(cur)
+        if (cur.status === 'done' || cur.status === 'error') break
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Solve failed')
+    } finally {
+      setSolving(false)
     }
   }
 
@@ -318,10 +401,36 @@ function App() {
             <p className="hint">Adaptive: stops early when the decision is clear.</p>
           </div>
 
+          <div className="field">
+            <label htmlFor="iters">GTO solver iterations</label>
+            <input
+              id="iters"
+              type="number"
+              min={50}
+              max={4000}
+              step={50}
+              value={solveIterations}
+              onChange={(e) => setSolveIterations(Number(e.target.value))}
+            />
+            <p className="hint">
+              More = closer to equilibrium, slower. ~300 is a good start.
+            </p>
+          </div>
+
           <div className="actions">
-            <button type="submit" className="btn primary" disabled={loading}>
+            <button type="submit" className="btn primary" disabled={loading || solving}>
               {loading && <span className="spinner" aria-hidden />}
-              {loading ? 'Running…' : 'Get recommendation'}
+              {loading ? 'Running…' : 'Quick recommendation'}
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={loading || solving}
+              onClick={onSolveGTO}
+              title="Run a real CFR solver on this spot — takes several seconds"
+            >
+              {solving && <span className="spinner" aria-hidden />}
+              {solving ? 'Solving…' : 'Run GTO solve'}
             </button>
           </div>
 
@@ -330,10 +439,108 @@ function App() {
 
         <div className="panel">
           <h2>Recommendation</h2>
-          {!result && !loading && (
+
+          {(solving || solveStatus) && (
+            <div
+              style={{
+                marginBottom: 18,
+                padding: 12,
+                border: '1px solid var(--border)',
+                borderRadius: 10,
+                background: 'var(--bg-2)',
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <strong>GTO solver</strong>
+                <span className="mono" style={{ color: 'var(--muted)' }}>
+                  {solveStatus
+                    ? `${solveStatus.status} · ${Math.round(
+                        solveStatus.progress * 100,
+                      )}% · ${solveStatus.elapsed_s.toFixed(1)}s`
+                    : 'starting…'}
+                </span>
+              </div>
+              <div className="equity-bar" style={{ marginTop: 8 }}>
+                <div
+                  className="fill"
+                  style={{
+                    width: `${Math.min(100, (solveStatus?.progress ?? 0) * 100)}%`,
+                  }}
+                />
+              </div>
+              {solveStatus?.error && (
+                <div className="error" style={{ marginTop: 8 }}>
+                  {solveStatus.error}
+                </div>
+              )}
+              {solveStatus?.result && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ color: 'var(--muted)', fontSize: 13 }}>
+                    Top action:{' '}
+                    <span className="mono" style={{ color: 'var(--text)' }}>
+                      {formatAction(solveStatus.result.top_action)}
+                    </span>{' '}
+                    · {Math.round(
+                      solveStatus.result.top_action_frequency * 100,
+                    )}
+                    %
+                  </div>
+                  <div style={{ marginTop: 8 }}>
+                    {solveStatus.result.root_actions.map((a) => {
+                      const p = solveStatus.result!.root_strategy[a] ?? 0
+                      return (
+                        <div
+                          key={a}
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '80px 1fr 50px',
+                            gap: 8,
+                            alignItems: 'center',
+                            marginBottom: 4,
+                          }}
+                        >
+                          <span className="mono" style={{ fontSize: 13 }}>
+                            {formatAction(a)}
+                          </span>
+                          <div className="equity-bar" style={{ marginTop: 0 }}>
+                            <div
+                              className="fill"
+                              style={{ width: `${Math.min(100, p * 100)}%` }}
+                            />
+                          </div>
+                          <span
+                            className="mono"
+                            style={{ fontSize: 12, textAlign: 'right' }}
+                          >
+                            {(p * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8 }}>
+                    {solveStatus.result.iterations_done} iters ·{' '}
+                    {solveStatus.result.villain_combos_used} villain combos ·
+                    range{' '}
+                    <span className="mono">
+                      {solveStatus.result.villain_range_used.slice(0, 60)}
+                      {solveStatus.result.villain_range_used.length > 60
+                        ? '…'
+                        : ''}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!result && !loading && !solving && !solveStatus && (
             <div className="placeholder">
               <div className="big">♠ ♥</div>
-              <p>Submit the form to see the line, equity, and reasoning.</p>
+              <p>
+                Get a quick recommendation, or run the GTO solver for a real
+                mixed strategy (takes a few seconds).
+              </p>
             </div>
           )}
           {result && (

@@ -11,6 +11,9 @@ Decisions blend three layers to get closer to professional play:
 
 from __future__ import annotations
 
+import threading
+import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -36,12 +39,15 @@ from strategy import (
     infer_villain_range,
     preflop_decision,
 )
+from gto import SolveResult, SubgameConfig, solve as cfr_solve
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     executor = ProcessPoolExecutor(max_workers=2)
     app.state.executor = executor
+    app.state.jobs = {}
+    app.state.jobs_lock = threading.Lock()
     try:
         yield
     finally:
@@ -565,6 +571,140 @@ def analyze(req: AnalyzeRequest, request: Request) -> AnalyzeResponse:
         source="postflop_mc",
         confidence="high",
     )
+
+
+class SolveRequest(BaseModel):
+    hero_cards: str = Field(..., min_length=4, max_length=4)
+    board: str = Field(...)
+    villain_range: str = Field(
+        "auto",
+        description="pokerkit range, 'auto' to infer, or 'random' for any-two.",
+    )
+    pot: float = Field(..., gt=0)
+    to_call: float = Field(0, ge=0)
+    hero_stack: float = Field(..., gt=0)
+    villain_stack: float | None = Field(None, gt=0)
+    hero_first_to_act: bool = True
+    hero_position: Position | None = None
+    aggressor_position: Position | None = None
+    facing_action: FacingAction = "bet"
+    iterations: int = Field(600, ge=50, le=4000)
+    equity_samples: int = Field(300, ge=50, le=2000)
+
+    @field_validator("hero_cards", "board")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        return v.strip().replace(" ", "")
+
+    @field_validator("board")
+    @classmethod
+    def _board_len(cls, v: str) -> str:
+        if len(v) not in (6, 8, 10):
+            raise ValueError("GTO solver requires a postflop board (3/4/5 cards).")
+        return v
+
+
+class SolveJobStatus(BaseModel):
+    id: str
+    status: Literal["pending", "running", "done", "error"]
+    progress: float
+    message: str
+    elapsed_s: float
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+def _run_solve_job(
+    app: FastAPI,
+    job_id: str,
+    req: SolveRequest,
+) -> None:
+    jobs = app.state.jobs
+    lock = app.state.jobs_lock
+    t0 = time.time()
+
+    def _update(**kwargs: Any) -> None:
+        with lock:
+            jobs[job_id].update(kwargs)
+            jobs[job_id]["elapsed_s"] = time.time() - t0
+
+    try:
+        villain_range_str = _resolve_villain_range(
+            req.villain_range,
+            req.hero_position,
+            req.facing_action,
+            req.aggressor_position,
+        )
+        cfg = SubgameConfig(
+            hero_hand=req.hero_cards,
+            board=req.board,
+            villain_range=villain_range_str,
+            pot=req.pot,
+            to_call=req.to_call,
+            hero_stack=req.hero_stack,
+            villain_stack=req.villain_stack or req.hero_stack,
+            hero_first_to_act=req.hero_first_to_act,
+            equity_samples=req.equity_samples,
+        )
+
+        _update(status="running")
+
+        def progress(p: float, msg: str) -> None:
+            _update(progress=p, message=msg)
+
+        result: SolveResult = cfr_solve(
+            cfg,
+            iterations=req.iterations,
+            seed=42,
+            progress_cb=progress,
+            executor=None,  # equity cache reduces work; inline avoids pool contention
+        )
+
+        top = max(result.root_strategy.items(), key=lambda kv: kv[1])
+        payload = {
+            "root_strategy": result.root_strategy,
+            "root_actions": result.root_actions,
+            "iterations_done": result.iterations_done,
+            "villain_combos_used": result.villain_combos_used,
+            "exploitability_proxy": result.exploitability_proxy,
+            "top_action": top[0],
+            "top_action_frequency": top[1],
+            "villain_range_used": villain_range_str,
+        }
+        _update(status="done", progress=1.0, message="solved", result=payload)
+    except Exception as e:
+        _update(status="error", error=f"{type(e).__name__}: {e}", message="failed")
+
+
+@app.post("/solve", response_model=SolveJobStatus)
+def start_solve(req: SolveRequest, request: Request) -> SolveJobStatus:
+    _validate_card_uniqueness(req.hero_cards, req.board)
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "id": job_id,
+        "status": "pending",
+        "progress": 0.0,
+        "message": "queued",
+        "elapsed_s": 0.0,
+        "result": None,
+        "error": None,
+    }
+    with request.app.state.jobs_lock:
+        request.app.state.jobs[job_id] = job
+    thread = threading.Thread(
+        target=_run_solve_job, args=(request.app, job_id, req), daemon=True
+    )
+    thread.start()
+    return SolveJobStatus(**job)
+
+
+@app.get("/solve/{job_id}", response_model=SolveJobStatus)
+def get_solve(job_id: str, request: Request) -> SolveJobStatus:
+    with request.app.state.jobs_lock:
+        job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return SolveJobStatus(**job)
 
 
 if __name__ == "__main__":
